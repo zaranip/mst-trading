@@ -229,7 +229,3 @@ The strategy operates using a weekly rebalancing cadence (executed on Friday clo
 * Klein, D. J., & Randić, M. (1993). *Resistance distance*. Journal of Mathematical Chemistry.
 * Onnela, J. P., et al. (2003). *Dynamics of market node topologies in stress environments*. Physica A: Statistical Mechanics and its Applications.
 * Pozzi, F., Di Matteo, T., & Aste, T. (2013). *Spread topology metrics and asset diversification risk mitigation*. Physical Review E.
-
-*** ### Summary of References (for your internal compilation)
-
-* **NASDAQ Data Link Search Query:** `FINM_Winter_2026_Group_K_QTS_Data_Cache` (included for verification references).
