@@ -137,8 +137,10 @@ def compute_rolling_correlations(
 def mantegna_distance(correlation_matrix: pd.DataFrame) -> pd.DataFrame:
     """Compute Mantegna distance: d_ij = sqrt(2 * (1 - rho_ij))."""
     rho = correlation_matrix.clip(-1.0, 1.0)
-    dist = np.sqrt(2.0 * (1.0 - rho))
-    np.fill_diagonal(dist.values, 0.0)
+    dist = np.sqrt(2.0 * (1.0 - rho)).copy()
+    arr = dist.to_numpy(copy=True)
+    np.fill_diagonal(arr, 0.0)
+    dist = pd.DataFrame(arr, index=dist.index, columns=dist.columns)
     return dist
 
 
@@ -259,9 +261,88 @@ def generate_trading_signals(
                     mat.loc[j, i] = -signal
             series.append(rij)
 
-        np.fill_diagonal(mat.values, 0.0)
+        arr = mat.to_numpy(copy=True)
+        np.fill_diagonal(arr, 0.0)
+        mat = pd.DataFrame(arr, index=mat.index, columns=mat.columns)
         output[date] = mat
     return output
+
+def compute_lambda_scale(
+    lambda_series: pd.Series,
+    mode: str = "large_only",   # "small_only", "large_only", "two_sided", "none"
+    min_periods: int = 20,
+    z_threshold: float = 2.75,
+    shrink_small: float = 0.5,
+    shrink_large: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Compute risk-control scaling based on Fiedler value (lambda_2).
+
+    Parameters
+    ----------
+    lambda_series : pd.Series
+        Time series of Fiedler values indexed by rebalance date.
+    mode : str
+        "small_only" : reduce exposure when lambda is unusually small
+        "large_only" : reduce exposure when lambda is unusually large
+        "two_sided"  : reduce exposure on both tails
+        "none"       : no lambda-based scaling
+    min_periods : int
+        Minimum history before activating thresholds.
+    z_threshold : float
+        Number of std devs used to define unusual lambda.
+    shrink_small : float
+        Multiplicative scale when lambda is too small.
+    shrink_large : float
+        Multiplicative scale when lambda is too large.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        lambda, mean, std, lower, upper, scale
+    """
+    lam = lambda_series.astype(float).copy()
+
+    mean = lam.expanding(min_periods=min_periods).mean()
+    std = lam.expanding(min_periods=min_periods).std(ddof=1).fillna(0.0)
+
+    lower = mean - z_threshold * std
+    upper = mean + z_threshold * std
+
+    scale = pd.Series(1.0, index=lam.index, dtype=float)
+
+    valid = mean.notna() & std.notna()
+
+    if mode == "small_only":
+        scale[valid & (lam < lower)] = shrink_small
+
+    elif mode == "large_only":
+        scale[valid & (lam > upper)] = shrink_large
+
+    elif mode == "two_sided":
+        scale[valid & (lam < lower)] = shrink_small
+        scale[valid & (lam > upper)] = np.minimum(
+            scale[valid & (lam > upper)],
+            shrink_large
+        )
+
+    elif mode == "none":
+        pass
+
+    else:
+        raise ValueError(f"Unsupported lambda scaling mode: {mode}")
+
+    out = pd.DataFrame(
+        {
+            "lambda": lam,
+            "mean": mean,
+            "std": std,
+            "lower": lower,
+            "upper": upper,
+            "scale": scale,
+        }
+    )
+    return out
 
 
 def compute_pair_weights(
@@ -276,6 +357,15 @@ def compute_pair_weights(
     leader_window: int = 20,
     max_pair_weight: float = 1.5,
     max_gross_leverage: float = 4.0,
+    lambda_risk_mode: str = "large_only",   # NEW
+    lambda_min_periods: int = 20,           # NEW
+    lambda_z_threshold: float = 2.75,        # NEW
+    lambda_shrink_small: float = 0.5,       # NEW
+    lambda_shrink_large: float = 0.5,       # NEW
+    z_threshold: Optional[float] = None,    # === NEW PARAM
+    shrink_small: Optional[float] = None,   # === NEW PARAM
+    shrink_large: Optional[float] = None,   # === NEW PARAM
+    use_mst_edges_only: bool = True,        # === NEW PARAM
 ) -> Dict[str, Dict[pd.Timestamp, pd.Series] | pd.Series]:
     """Compute pair and aggregate asset weights using volatility-targeted sizing.
 
@@ -294,16 +384,36 @@ def compute_pair_weights(
     asset_weights_out: Dict[pd.Timestamp, pd.Series] = {}
 
     if fiedler_values is None:
-        lambda_series = pd.Series(1.0, index=dates)
+        lambda_series = pd.Series(1.0, index=dates, dtype=float)
+        lambda_diag = pd.DataFrame(
+            {
+                "lambda": lambda_series,
+                "mean": np.nan,
+                "std": np.nan,
+                "lower": np.nan,
+                "upper": np.nan,
+                "scale": 1.0,
+            },
+            index=dates,
+        )
     else:
         lambda_series = fiedler_values.reindex(dates).astype(float)
+        # === MODIFIED
+        effective_z_threshold = lambda_z_threshold if z_threshold is None else z_threshold
+        # === MODIFIED
+        effective_shrink_small = lambda_shrink_small if shrink_small is None else shrink_small
+        # === MODIFIED
+        effective_shrink_large = lambda_shrink_large if shrink_large is None else shrink_large
+        lambda_diag = compute_lambda_scale(
+            lambda_series=lambda_series,
+            mode=lambda_risk_mode,
+            min_periods=lambda_min_periods,
+            z_threshold=effective_z_threshold,     # === MODIFIED
+            shrink_small=effective_shrink_small,   # === MODIFIED
+            shrink_large=effective_shrink_large,   # === MODIFIED
+        )
 
-    lambda_mean = lambda_series.expanding(min_periods=20).mean()
-    lambda_std = lambda_series.expanding(min_periods=20).std(ddof=1).fillna(0.0)
-    lambda_floor = lambda_mean - 1.5 * lambda_std
-    lambda_scale = pd.Series(1.0, index=dates)
-    lambda_scale[lambda_series < lambda_floor] = 0.5
-
+    lambda_scale = lambda_diag["scale"].reindex(dates).fillna(1.0)
     for date in dates:
         if date not in returns.index:
             continue
@@ -332,7 +442,7 @@ def compute_pair_weights(
         for i in assets:
             for j in assets:
                 if i < j:
-                    if allowed_pairs is not None and (i, j) not in allowed_pairs:
+                    if use_mst_edges_only and allowed_pairs is not None and (i, j) not in allowed_pairs:  # === MODIFIED
                         continue
                     s = float(sig.loc[i, j])
                     if np.isfinite(s):
@@ -347,6 +457,7 @@ def compute_pair_weights(
         pair_vals: Dict[Tuple[str, str], float] = {}
         asset_w = pd.Series(0.0, index=assets)
         for (a, b), signal in chosen:
+
             ra = hist_beta[a].dropna()
             rb = hist_beta[b].dropna()
             joined = pd.concat([ra, rb], axis=1, join="inner").dropna()
@@ -358,7 +469,7 @@ def compute_pair_weights(
                 continue
             beta = float(np.cov(joined.iloc[:, 0].values, joined.iloc[:, 1].values, ddof=1)[0, 1] / beta_denom)
 
-            spread = joined.iloc[:, 0] - beta * joined.iloc[:, 1]
+            spread = joined.iloc[:, 0] - joined.iloc[:, 1]
             sigma_ij = float(spread.std(ddof=1) * np.sqrt(252.0))
             # Floor spread vol to prevent weight explosion when pairs co-move perfectly
             sigma_ij = max(sigma_ij, 0.01)
@@ -400,6 +511,7 @@ def compute_pair_weights(
         "pair_weights": pair_weights_out,
         "asset_weights": asset_weights_out,
         "lambda2_scale": lambda_scale,
+        "lambda2_diag": lambda_diag,
     }
 
 def simulate_strategy(
@@ -571,3 +683,44 @@ def run_weekly_mst_pipeline(
         "fiedler_values": fiedler_series,
         "signals": signals,
     }
+
+
+# === NEW PARAM
+def run_strategy_with_params(
+    prices: pd.DataFrame,
+    params: Optional[Dict[str, object]] = None,
+) -> Dict[str, Dict[pd.Timestamp, pd.Series] | pd.Series]:
+    # === MODIFIED
+    cfg = params or {}
+
+    # === MODIFIED
+    pipeline = run_weekly_mst_pipeline(
+        prices=prices,
+        corr_window=int(cfg.get("corr_window", 252)),                  # === NEW PARAM
+        resistance_lookback=int(cfg.get("resistance_lookback", 60)),   # === NEW PARAM
+    )
+
+    # === MODIFIED
+    weights = compute_pair_weights(
+        signals=cast(Dict[pd.Timestamp, pd.DataFrame], pipeline["signals"]),
+        returns=cast(pd.DataFrame, pipeline["returns"]),
+        fiedler_values=cast(pd.Series, pipeline["fiedler_values"]),
+        mst_by_date=cast(Dict[pd.Timestamp, List[Edge]], pipeline["mst_by_date"]),
+        asset_names=[str(c) for c in prices.columns],
+        sigma_target=float(cfg.get("sigma_target", 0.10)),                    # === NEW PARAM
+        max_pairs=int(cfg.get("max_pairs", 15)),                               # === NEW PARAM
+        beta_window=int(cfg.get("beta_window", 60)),                           # === NEW PARAM
+        leader_window=int(cfg.get("leader_window", 20)),                       # === NEW PARAM
+        max_pair_weight=float(cfg.get("max_pair_weight", 1.5)),                # === NEW PARAM
+        max_gross_leverage=float(cfg.get("max_gross_leverage", 4.0)),          # === NEW PARAM
+        lambda_risk_mode=str(cfg.get("lambda_risk_mode", "large_only")),       # === NEW PARAM
+        lambda_min_periods=int(cfg.get("lambda_min_periods", 20)),             # === NEW PARAM
+        lambda_z_threshold=float(cfg.get("lambda_z_threshold", 2.75)),         # === NEW PARAM
+        lambda_shrink_small=float(cfg.get("lambda_shrink_small", 0.5)),        # === NEW PARAM
+        lambda_shrink_large=float(cfg.get("lambda_shrink_large", 0.5)),        # === NEW PARAM
+        z_threshold=cast(Optional[float], cfg.get("z_threshold")),             # === NEW PARAM
+        shrink_small=cast(Optional[float], cfg.get("shrink_small")),           # === NEW PARAM
+        shrink_large=cast(Optional[float], cfg.get("shrink_large")),           # === NEW PARAM
+        use_mst_edges_only=bool(cfg.get("use_mst_edges_only", True)),          # === NEW PARAM
+    )
+    return weights
